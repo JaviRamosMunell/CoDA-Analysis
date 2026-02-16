@@ -1,0 +1,1650 @@
+---
+  title: "CoDA Analysis"
+author: "Javier Ramos Munell"
+date: "2026-02-16"
+output: html_document
+---
+  
+# Packages used
+library(compositions)
+library(tidyverse)
+library(lme4)
+library(rgl)
+library(plotly)
+
+#Load to base data
+setwd("/Users/javierramosmunell/Desktop/FINLAND CODA")
+data <- read.csv2("SUNRISE_Finland_CoDa.csv")
+
+
+#look at the dataset 
+#top few rows
+head(data)
+
+
+
+#####VARIABLES #####
+#select the variables that we might want (we will rename some of the complex names during the selection process)
+data = data %>% dplyr::select (SEX = dg_child_sex, 
+                             AGE = dg_child_age_calc_years, 
+                             SES = dg_sector, 
+                             EDUC = household_education_CAT3,
+                             INCOME = FIN_relative_household_income_cat3,
+                             ZBMI = IOTF_BMIzScore, 
+                             SB = dur_day_total_IN_min_wei, 
+                             LPA = dur_day_total_LIG_min_wei, 
+                             MVPA = dur_day_total_MVPA_wei, 
+                             Sleep = total_sleep_wei,
+                             ID = ID,
+                             Area = Areas_4,
+                             )
+
+head(data)
+
+# reframing z-scores assuming first "." sets the decimals
+reframe_numeric <- function(x) {
+  x_clean <- sub("\\.", "@", x)          # mark first dot
+  x_clean <- gsub("\\.", "", x_clean)    # remove remaining dots
+  x_clean <- sub("@", ".", x_clean)      # restore decimal dot
+  as.numeric(x_clean)
+}
+
+# data reframing
+data$ZBMI <- reframe_numeric(data$ZBMI)
+data$AGE <- reframe_numeric(data$AGE)
+
+
+# modificación de la variable z-BMI considering the under-and-up classification
+data <- data %>%
+  mutate(owob = case_when(
+    AGE <= 5 & ZBMI < -3 ~ "Severamente desnutrido",
+    AGE <= 5 & ZBMI < -2 ~ "Peso insuficiente",
+    AGE <= 5 & ZBMI < 1 ~ "Normopeso",
+    AGE <= 5 & ZBMI < 2 ~ "Riesgo_sob",
+    AGE <= 5 & ZBMI < 3 ~ "Sobrepeso",
+    AGE <= 5 & ZBMI > 3 ~ "Obesidad",
+  ),
+  owob_num = case_when(
+    owob == "Severamente desnutrido" ~ -3,
+    owob == "Peso insuficiente" ~ -2,
+    owob == "Normopeso" ~ 1,
+    owob == "Riesgo_sob" ~ 2,
+    owob == "Sobrepeso" ~ 3,
+    owob == "Obesidad" ~ 4
+  ),
+  SEX = factor(SEX))
+
+
+
+#see what sort of variables R thinks these are 
+str(data)
+
+#will need to change some of these variables to factors. 
+data$sex = factor(data$SEX) 
+data$EDUC = factor(data$EDUC)
+data$INCOME = factor(data$INCOME)
+data$SES = factor(data$SES)
+
+#compositional variables 
+data$comp = data %>% select( SB, LPA, MVPA, Sleep) 
+head(data$comp)
+
+#Make ilrs - use default ilr transformation as we are not going to interpret individual regression coefficients. 
+data$ilrs = ilr(data$comp)
+
+#will save them as separate variables rather than a set of ilrs (helps with prediction later)
+data$ilr1 = data$ilrs[,1] 
+data$ilr2 = data$ilrs[,2] 
+data$ilr3 = data$ilrs[,3]
+
+# Crear un dataframe con las nuevas variables ILR
+ilr_data <- data.frame(
+  id = data$ID,          # Suponiendo que 'id' es un identificador único para cada participante
+  ilr1 = data$ilr1,
+  ilr2 = data$ilr2,
+  ilr3 = data$ilr3
+  )
+ilr_data <- cbind(data$id, data$ilr1, data$ilr2, data$ilr3)
+
+colnames(data)
+
+
+# Muestra el dataframe resultante
+print(ilr_data)
+###### MODEL ######
+#######now that data is set up, start making the analytical models. 
+#Research Q - what time-use compositions are associated with the best fitness (highest number of shuttles) and fatness (lowest WHT, or we could use a target WHT ratio) 
+#the first step is to get the best fitting models - I'm using sample specific z-scores for the outcomes (scale()) to make interpretation easier
+
+# UPDATE: numeric tranasformation for ZBMI
+data$ZBMI <- as.numeric(data$ZBMI)
+# values lower and upper than -3 or 3 are not plausible
+data <- data %>% filter(ZBMI >= -3 & ZBMI <= 3)
+
+######Zbmi#####
+#MODEL#
+# question here: why scale(log(ZBMI))? does it make statistical sense to conduct this tranformation?
+mod.ZBMI = lmer(ZBMI ~ cbind(ilr1, ilr2, ilr3) + SEX + AGE + SES + EDUC + INCOME + (1|Area) , data=data)
+# double-check:
+
+# UPDATE 29th Jan 2026
+## We tested adding a random intercept for SEX to observe how predictions change
+## Same best 10% for girls and boys (same for more parsimonious model)
+
+# ALSO, WE TESTED FOR AN INTERACTION MODEL, IN WHICH THE INTERACTION DID NOT SHOW STATISTICAL SIGNIFICANCE
+## In this case, the research question is: does the optimal 24-h composition differ between boys and girls?
+mod.ZBMI_int = lmer(ZBMI ~ cbind(ilr1, ilr2, ilr3) * SEX + AGE + SES + EDUC + INCOME + (1|Area) , data=data)
+
+# to establish interaction between composition and household income
+mod.ZBMI_INCOME_int = lmer(ZBMI ~ cbind(ilr1, ilr2, ilr3) * INCOME + AGE + SES + EDUC + SEX + (1|Area) , data=data)
+# summary of the model
+summary(mod.ZBMI)
+hist(residuals(mod.ZBMI))
+
+#composition is a significant predictor of zbmi.
+car::Anova(mod.ZBMI, test.statistic= "F")
+car::Anova(mod.ZBMI_int, test.statistic= "F")
+
+#have a look to see if a quadratic term is indicated for the ilrs. Can use the poly(,2) function
+#observations are nested in schools, school is a random intercept
+
+mod.ZBMI2 = lmer(ZBMI ~ poly(cbind(ilr1, ilr2, ilr3),2) + SEX + AGE + SES + EDUC + INCOME + (1|Area) , data=data)
+anova(mod.ZBMI, mod.ZBMI_int, mod.ZBMI2)
+
+# Interacción con EDUC
+mod.ZBMI_EDUC_int <- lmer(
+  ZBMI ~ cbind(ilr1, ilr2, ilr3) * EDUC +
+    AGE + SES + SEX + INCOME + (1 | Area),
+  data = data
+)
+
+# Interacción con SES
+mod.ZBMI_SES_int <- lmer(
+  ZBMI ~ cbind(ilr1, ilr2, ilr3) * SES +
+    AGE + EDUC + SEX + INCOME + (1 | Area),
+  data = data
+)
+
+car::Anova(mod.ZBMI_EDUC_int, test.statistic = "F")
+car::Anova(mod.ZBMI_SES_int, test.statistic = "F")
+
+
+#(the feasible range of time-use compositions observed within our sample)
+#there are lots of ways of making hypothetical time-use compositions,
+#one way is to create an evenly spaced "grid" of data points, for example
+#to create every possible time-use composition in 10-minute increments.
+
+#I'll start by making a grid that is larger than current min/max time spent in each variable
+
+range(as.numeric(data$comp$Sleep), na.rm = TRUE)
+range(as.numeric(data$comp$SB), na.rm = TRUE)
+range(as.numeric(data$comp$LPA), na.rm = TRUE)
+range(as.numeric(data$comp$MVPA), na.rm = TRUE)
+
+mygrid=rbind(expand.grid( Sleep=seq(min(0), max(920),10),
+                           SB=seq(min(40), max(700), 10), 
+                           LPA=seq(min(0), max(250), 10), 
+                           MVPA=seq(min(0), max(300), 10)))
+
+head(mygrid)
+
+#only keep compositions in this grid that sum to 1440
+mg=subset(mygrid, rowSums(mygrid) == 1440)
+
+#can truncate at +/- 3SD if you want to get rid of outliers in univariate activities
+#get highest/lowest bounds of actvity behaviours at +/- 3SD from the sample mean for predictive grid
+MVPA1 = pmax(pmin(as.numeric(data$comp$MVPA), 
+                  mean(as.numeric(data$comp$MVPA), na.rm = TRUE) + sd(as.numeric(data$comp$MVPA)), na.rm = TRUE * 3),
+             0) 
+LPA1 = pmax(pmin(as.numeric(data$comp$LPA), 
+               mean(as.numeric(data$comp$LPA), na.rm = TRUE) + sd(as.numeric(data$comp$LPA)), na.rm = TRUE * 3),
+          mean(as.numeric(data$comp$LPA), na.rm = TRUE) - sd(as.numeric(data$comp$LPA), na.rm = TRUE) * 3)
+SB1 = pmax(pmin(as.numeric(data$comp$SB), 
+                mean(as.numeric(data$comp$SB), na.rm = TRUE) + sd(as.numeric(data$comp$SB)), na.rm = TRUE * 3),
+           mean(as.numeric(data$comp$SB), na.rm = TRUE) - sd(as.numeric(data$comp$SB), na.rm = TRUE) * 3)
+SL1 = pmax(pmin(as.numeric(data$comp$Sleep), 
+              mean(as.numeric(data$comp$Sleep), na.rm = TRUE) + sd(as.numeric(data$comp$Sleep)), na.rm = TRUE * 3),
+              mean(as.numeric(data$comp$Sleep), na.rm = TRUE) - sd(as.numeric(data$comp$Sleep), na.rm = TRUE) * 3)
+
+#can use these bounds to trim the predictive grid to values observed in sample
+mg1=subset(mg, mg$Sleep<max(SL1, na.rm = TRUE) & mg$Sleep>min(SL1, na.rm = TRUE))
+mg2=subset(mg1, mg1$SB<max(SB1, na.rm = TRUE) & mg1$SB>min(SB1, na.rm = TRUE))
+mg3=subset(mg2, mg2$LPA<max(LPA1, na.rm = TRUE) & mg2$LPA>min(LPA1, na.rm = TRUE))
+mg4=subset(mg3, mg3$MVPA<max(MVPA1, na.rm = TRUE) & mg3$MVPA>min(MVPA1, na.rm = TRUE))
+
+#make the grid a compositional object
+griddata=acomp(mg4, warn.na = TRUE)
+min(griddata)
+summary(as.data.frame(griddata))
+
+# UPDATE
+griddata_num <- unclass(griddata)
+
+#these are the first few rows of the grid
+head(as.data.frame(griddata))
+nrow(as.data.frame(griddata))
+
+#make ilrs from the griddata. 
+#check for zeros first
+missingSummary(griddata)
+ilr.grid = ilr(griddata)
+
+#can have a look at the predictive grid in 3-D
+
+#produces an interactive plot that you can zoom in, drag around to look at it.
+# UPDATE:
+compositions::plot.acomp(griddata)
+#plot3D(griddata_num)
+#rglwidget()
+
+#these are the actual observed data
+#plot3D(acomp(data$comp))
+#rglwidget()
+
+df.ZBMI <- as.data.frame(griddata)
+
+### PREDICTIONS ###
+
+# The predictions made via our standard model are valid for the overall best composition
+# This composition will be the same for any individual in the grid
+
+# Predictions for BOYS
+predboys <- predict(mod.ZBMI, 
+                    newdata = data.frame(ilr1 = ilr.grid[, 1], 
+                                         ilr2 = ilr.grid[, 2], 
+                                         ilr3 = ilr.grid[, 3], 
+                                         SES = rep("1", nrow(griddata)), 
+                                         AGE = rep(mean(data$AGE, na.rm = TRUE), nrow(griddata)), 
+                                         SEX = rep("1", nrow(griddata)),
+                                         # NEW VARIABLES
+                                         EDUC = rep("2", nrow(griddata)),
+                                         INCOME = rep("2", nrow(griddata))),
+                    re.form = NA)
+
+# Predictions for GIRLS
+predgirls <- predict(mod.ZBMI, 
+                     newdata = data.frame(ilr1 = ilr.grid[, 1], 
+                                          ilr2 = ilr.grid[, 2], 
+                                          ilr3 = ilr.grid[, 3], 
+                                          SES = rep("1", nrow(griddata)), 
+                                          AGE = rep(mean(data$AGE, na.rm = TRUE), nrow(griddata)), 
+                                          SEX = rep("2", nrow(griddata)),
+                                          # NEW VARIABLES
+                                          EDUC = rep("2", nrow(griddata)),
+                                          INCOME = rep("2", nrow(griddata))),
+                     re.form = NA)
+
+#and then find the average of the two (population has about 50:50 boys:girls) 
+pred.ZBMI=rowMeans(cbind(predboys, predgirls))
+
+
+### UPDATE: PREDICTIONS USING THE INTERACTION MODEL
+### In this model we are assuming different sex-specific patterns
+## even though the model fit did not show any advantage of this interaction
+
+# Predictions for BOYS
+predboys_int <- predict(mod.ZBMI_int, 
+                    newdata = data.frame(ilr1 = ilr.grid[, 1], 
+                                         ilr2 = ilr.grid[, 2], 
+                                         ilr3 = ilr.grid[, 3], 
+                                         SES = rep("1", nrow(griddata)), 
+                                         AGE = rep(mean(data$AGE, na.rm = TRUE), nrow(griddata)), 
+                                         SEX = rep("1", nrow(griddata)),
+                                         # NEW VARIABLES
+                                         EDUC = rep("2", nrow(griddata)),
+                                         INCOME = rep("2", nrow(griddata))),
+                    re.form = NA)
+
+# Predictions for GIRLS
+predgirls_int <- predict(mod.ZBMI_int, 
+                     newdata = data.frame(ilr1 = ilr.grid[, 1], 
+                                          ilr2 = ilr.grid[, 2], 
+                                          ilr3 = ilr.grid[, 3], 
+                                          SES = rep("1", nrow(griddata)), 
+                                          AGE = rep(mean(data$AGE, na.rm = TRUE), nrow(griddata)), 
+                                          SEX = rep("2", nrow(griddata)),
+                                          # NEW VARIABLES
+                                          EDUC = rep("2", nrow(griddata)),
+                                          INCOME = rep("2", nrow(griddata))),
+                     re.form = NA)
+
+
+#########UPDATE FOR HOUSEHOLD INCOME PREDICTIONS######
+
+### First, to set a fixed level for SES, SEX, and EDUC, we observed which class is dominant by:
+# table(data$SEX) or table(data$EDUC)
+
+# Predictions for INCOME == 1
+INCOME_1 <- predict(mod.ZBMI_INCOME_int, 
+                        newdata = data.frame(ilr1 = ilr.grid[, 1], 
+                                             ilr2 = ilr.grid[, 2], 
+                                             ilr3 = ilr.grid[, 3], 
+                                             SES = rep("1", nrow(griddata)), 
+                                             AGE = rep(mean(data$AGE, na.rm = TRUE), nrow(griddata)), 
+                                             SEX = rep("1", nrow(griddata)),
+                                             # NEW VARIABLES
+                                             EDUC = rep("3", nrow(griddata)),
+                                             INCOME = rep("1", nrow(griddata))),
+                        re.form = NA)
+
+# Predictions for INCOME == 2
+INCOME_2 <- predict(mod.ZBMI_INCOME_int, 
+                         newdata = data.frame(ilr1 = ilr.grid[, 1], 
+                                              ilr2 = ilr.grid[, 2], 
+                                              ilr3 = ilr.grid[, 3], 
+                                              SES = rep("1", nrow(griddata)), 
+                                              AGE = rep(mean(data$AGE, na.rm = TRUE), nrow(griddata)), 
+                                              SEX = rep("1", nrow(griddata)),
+                                              # NEW VARIABLES
+                                              EDUC = rep("3", nrow(griddata)),
+                                              INCOME = rep("2", nrow(griddata))),
+                         re.form = NA)
+
+# Predictions for INCOME == 3
+INCOME_3 <- predict(mod.ZBMI_INCOME_int, 
+                         newdata = data.frame(ilr1 = ilr.grid[, 1], 
+                                              ilr2 = ilr.grid[, 2], 
+                                              ilr3 = ilr.grid[, 3], 
+                                              SES = rep("1", nrow(griddata)), 
+                                              AGE = rep(mean(data$AGE, na.rm = TRUE), nrow(griddata)), 
+                                              SEX = rep("1", nrow(griddata)),
+                                              # NEW VARIABLES
+                                              EDUC = rep("3", nrow(griddata)),
+                                              INCOME = rep("3", nrow(griddata))),
+                         re.form = NA)
+
+
+#########UPDATE FOR HOUSEHOLD EDUCATIONAL PREDICTIONS######mod.ZBMI_EDUC_int
+# EDUC = 1
+EDUC_1 <- predict(
+  mod.ZBMI_EDUC_int,
+  newdata = data.frame(
+    ilr1 = ilr.grid[,1],
+    ilr2 = ilr.grid[,2],
+    ilr3 = ilr.grid[,3],
+    AGE = rep(mean(data$AGE, na.rm = TRUE), nrow(griddata)),
+    SEX = rep("1", nrow(griddata)),
+    SES = rep("1", nrow(griddata)),
+    INCOME = rep("2", nrow(griddata)),
+    EDUC = rep("1", nrow(griddata))
+  ),
+  re.form = NA
+)
+
+# EDUC = 2
+EDUC_2 <- predict(
+  mod.ZBMI_EDUC_int,
+  newdata = data.frame(
+    ilr1 = ilr.grid[,1],
+    ilr2 = ilr.grid[,2],
+    ilr3 = ilr.grid[,3],
+    AGE = rep(mean(data$AGE, na.rm = TRUE), nrow(griddata)),
+    SEX = rep("1", nrow(griddata)),
+    SES = rep("1", nrow(griddata)),
+    INCOME = rep("2", nrow(griddata)),
+    EDUC = rep("2", nrow(griddata))
+  ),
+  re.form = NA
+)
+
+# EDUC = 3
+EDUC_3 <- predict(
+  mod.ZBMI_EDUC_int,
+  newdata = data.frame(
+    ilr1 = ilr.grid[,1],
+    ilr2 = ilr.grid[,2],
+    ilr3 = ilr.grid[,3],
+    AGE = rep(mean(data$AGE, na.rm = TRUE), nrow(griddata)),
+    SEX = rep("1", nrow(griddata)),
+    SES = rep("1", nrow(griddata)),
+    INCOME = rep("2", nrow(griddata)),
+    EDUC = rep("3", nrow(griddata))
+  ),
+  re.form = NA
+)
+
+#########UPDATE FOR SES PREDICTIONS######mod.ZBMI_SES_int
+
+# SES = 1 (Urban)
+SES_1 <- predict(
+  mod.ZBMI_SES_int,
+  newdata = data.frame(
+    ilr1 = ilr.grid[,1],
+    ilr2 = ilr.grid[,2],
+    ilr3 = ilr.grid[,3],
+    AGE = rep(mean(data$AGE, na.rm = TRUE), nrow(griddata)),
+    SEX = rep("1", nrow(griddata)),
+    EDUC = rep("2", nrow(griddata)),
+    INCOME = rep("2", nrow(griddata)),
+    SES = rep("1", nrow(griddata))
+  ),
+  re.form = NA
+)
+
+# SES = 2 (Rural)
+SES_2 <- predict(
+  mod.ZBMI_SES_int,
+  newdata = data.frame(
+    ilr1 = ilr.grid[,1],
+    ilr2 = ilr.grid[,2],
+    ilr3 = ilr.grid[,3],
+    AGE = rep(mean(data$AGE, na.rm = TRUE), nrow(griddata)),
+    SEX = rep("1", nrow(griddata)),
+    EDUC = rep("2", nrow(griddata)),
+    INCOME = rep("2", nrow(griddata)),
+    SES = rep("2", nrow(griddata))
+  ),
+  re.form = NA
+)
+
+
+#this makes a dataframe with the predictive grid and the outcome score 
+df.ZBMI1 <- data.frame(Sleep=griddata[,1],SB=griddata[,2], LPA=griddata[,3], MVPA=griddata[,4], Predicted_Outcome_Zscore=pred.ZBMI)
+
+# UPDATE: to extract predicted outcomes for strata of interest
+## Example: stratification by SEX
+df.ZBMI_boys <- data.frame(Sleep=griddata[,1],SB=griddata[,2], LPA=griddata[,3], MVPA=griddata[,4], Predicted_Outcome_Zscore=predboys_int)
+df.ZBMI_girls <- data.frame(Sleep=griddata[,1],SB=griddata[,2], LPA=griddata[,3], MVPA=griddata[,4], Predicted_Outcome_Zscore=predgirls_int)
+
+### NEW PREDICTIONS FOR INCOME
+df.ZBMI_income1 <- data.frame(Sleep=griddata[,1],SB=griddata[,2], LPA=griddata[,3], MVPA=griddata[,4], Predicted_Outcome_Zscore=INCOME_1)
+df.ZBMI_income2 <- data.frame(Sleep=griddata[,1],SB=griddata[,2], LPA=griddata[,3], MVPA=griddata[,4], Predicted_Outcome_Zscore=INCOME_2)
+df.ZBMI_income3 <- data.frame(Sleep=griddata[,1],SB=griddata[,2], LPA=griddata[,3], MVPA=griddata[,4], Predicted_Outcome_Zscore=INCOME_3)
+
+### NEW PREDICTIONS FOR EDUCATIONAL
+
+df.ZBMI_educ1 <- data.frame(
+  Sleep = griddata[,1],
+  SB    = griddata[,2],
+  LPA   = griddata[,3],
+  MVPA  = griddata[,4],
+  Predicted_Outcome_Zscore = EDUC_1
+)
+
+df.ZBMI_educ2 <- data.frame(
+  Sleep = griddata[,1],
+  SB    = griddata[,2],
+  LPA   = griddata[,3],
+  MVPA  = griddata[,4],
+  Predicted_Outcome_Zscore = EDUC_2
+)
+
+df.ZBMI_educ3 <- data.frame(
+  Sleep = griddata[,1],
+  SB    = griddata[,2],
+  LPA   = griddata[,3],
+  MVPA  = griddata[,4],
+  Predicted_Outcome_Zscore = EDUC_3
+)
+
+### NEW PREDICTIONS FOR SES
+df.ZBMI_ses1 <- data.frame(
+  Sleep = griddata[,1],
+  SB    = griddata[,2],
+  LPA   = griddata[,3],
+  MVPA  = griddata[,4],
+  Predicted_Outcome_Zscore = SES_1
+)
+
+df.ZBMI_ses2 <- data.frame(
+  Sleep = griddata[,1],
+  SB    = griddata[,2],
+  LPA   = griddata[,3],
+  MVPA  = griddata[,4],
+  Predicted_Outcome_Zscore = SES_2
+)
+
+
+# plots to understand the difference between standard linear model and interaction model
+library(cowplot)
+library(patchwork)
+(df.ZBMI1 %>%
+  mutate(pred_boys = predboys,
+         pred_girls = predgirls) %>%
+  group_by(MVPA) %>%
+  summarise(pred_boys = mean(pred_boys),
+            pred_girls = mean(pred_girls)) %>%
+  ungroup() %>%
+  ggplot(aes(x = MVPA, y = pred_boys)) +
+  geom_line(col = "blue") +
+  geom_line(aes(y = pred_girls), col = "pink2") +
+  labs(x = "Weekly MVPA (min)",
+       y = "BMI z-score",
+       title = "Standard model (best model fit)") +
+  theme_bw() + df.ZBMI1 %>%
+    mutate(pred_boys = predboys,
+           pred_girls = predgirls) %>%
+    group_by(LPA) %>%
+    summarise(pred_boys = mean(pred_boys),
+              pred_girls = mean(pred_girls)) %>%
+    ungroup() %>%
+    ggplot(aes(x = LPA, y = pred_boys)) +
+    geom_line(col = "blue") +
+    geom_line(aes(y = pred_girls), col = "pink2") +
+    labs(x = "Weekly LPA (min)",
+         y = "BMI z-score") +
+    theme_bw() + df.ZBMI1 %>%
+    mutate(pred_boys = predboys,
+           pred_girls = predgirls) %>%
+    group_by(SB) %>%
+    summarise(pred_boys = mean(pred_boys),
+              pred_girls = mean(pred_girls)) %>%
+    ungroup() %>%
+    ggplot(aes(x = SB, y = pred_boys)) +
+    geom_line(col = "blue") +
+    geom_line(aes(y = pred_girls), col = "pink2") +
+    labs(x = "Weekly SB (min)",
+         y = "BMI z-score") +
+    theme_bw() + df.ZBMI1 %>%
+    mutate(pred_boys = predboys,
+           pred_girls = predgirls) %>%
+    group_by(Sleep) %>%
+    summarise(pred_boys = mean(pred_boys),
+              pred_girls = mean(pred_girls)) %>%
+    ungroup() %>%
+    ggplot(aes(x = Sleep, y = pred_boys)) +
+    geom_line(col = "blue") +
+    geom_line(aes(y = pred_girls), col = "pink2") +
+    labs(x = "Weekly Sleep (min)",
+         y = "BMI z-score") +
+    theme_bw()) /
+    (df.ZBMI1 %>%
+    mutate(pred_boys = predboys_int,
+           pred_girls = predgirls_int) %>%
+    group_by(MVPA) %>%
+    summarise(pred_boys = mean(pred_boys),
+              pred_girls = mean(pred_girls)) %>%
+    ungroup() %>%
+    ggplot(aes(x = MVPA, y = pred_boys)) +
+    geom_line(col = "blue") +
+    geom_line(aes(y = pred_girls), col = "pink2") +
+    labs(x = "Weekly MVPA (min)",
+         y = "BMI z-score",
+         title = "Interaction model") +
+  theme_bw() + df.ZBMI1 %>%
+    mutate(pred_boys = predboys_int,
+           pred_girls = predgirls_int) %>%
+    group_by(LPA) %>%
+    summarise(pred_boys = mean(pred_boys),
+              pred_girls = mean(pred_girls)) %>%
+    ungroup() %>%
+    ggplot(aes(x = LPA, y = pred_boys)) +
+    geom_line(col = "blue") +
+    geom_line(aes(y = pred_girls), col = "pink2") +
+    labs(x = "Weekly LPA (min)",
+         y = "BMI z-score") +
+    theme_bw() + df.ZBMI1 %>%
+    mutate(pred_boys = predboys_int,
+           pred_girls = predgirls_int) %>%
+    group_by(SB) %>%
+    summarise(pred_boys = mean(pred_boys),
+              pred_girls = mean(pred_girls)) %>%
+    ungroup() %>%
+    ggplot(aes(x = SB, y = pred_boys)) +
+    geom_line(col = "blue") +
+    geom_line(aes(y = pred_girls), col = "pink2") +
+    labs(x = "Weekly SB (min)",
+         y = "BMI z-score") +
+    theme_bw() + df.ZBMI1 %>%
+    mutate(pred_boys = predboys_int,
+           pred_girls = predgirls_int) %>%
+    group_by(Sleep) %>%
+    summarise(pred_boys = mean(pred_boys),
+              pred_girls = mean(pred_girls)) %>%
+    ungroup() %>%
+    ggplot(aes(x = Sleep, y = pred_boys)) +
+    geom_line(col = "blue") +
+    geom_line(aes(y = pred_girls), col = "pink2") +
+    labs(x = "Weekly Sleep (min)",
+         y = "BMI z-score") +
+    theme_bw())
+
+
+#extract the composition associated of predicted bmi
+best.ZBMI <- df.ZBMI1 %>%
+  arrange(abs(Predicted_Outcome_Zscore)) %>%
+  slice(1:floor(0.1 * n()))
+
+
+# UPDATE: illustrated for SEX variable
+best.ZBMI_boys <- df.ZBMI_boys %>%
+  arrange(abs(Predicted_Outcome_Zscore)) %>%
+  slice(1:floor(0.1 * n()))
+
+best.ZBMI_girls <- df.ZBMI_girls %>%
+  arrange(abs(Predicted_Outcome_Zscore)) %>%
+  slice(1:floor(0.1 * n()))
+
+
+### NEW UPDATE FOR INCOME
+best.ZBMI_income1 <- df.ZBMI_income1 %>%
+  arrange(abs(Predicted_Outcome_Zscore)) %>%
+  slice(1:floor(0.1 * n()))
+
+best.ZBMI_income2 <- df.ZBMI_income2 %>%
+  arrange(abs(Predicted_Outcome_Zscore)) %>%
+  slice(1:floor(0.1 * n()))
+
+best.ZBMI_income3 <- df.ZBMI_income3 %>%
+  arrange(abs(Predicted_Outcome_Zscore)) %>%
+  slice(1:floor(0.1 * n()))
+
+
+### NEW UPDATE FOR EDUCATIONAL
+best.ZBMI_educ1 <- df.ZBMI_educ1 %>%
+  arrange(abs(Predicted_Outcome_Zscore)) %>%
+  slice(1:floor(0.1 * n()))
+
+best.ZBMI_educ2 <- df.ZBMI_educ2 %>%
+  arrange(abs(Predicted_Outcome_Zscore)) %>%
+  slice(1:floor(0.1 * n()))
+
+best.ZBMI_educ3 <- df.ZBMI_educ3 %>%
+  arrange(abs(Predicted_Outcome_Zscore)) %>%
+  slice(1:floor(0.1 * n()))
+
+
+### NEW UPDATE FOR SES
+best.ZBMI_ses1 <- df.ZBMI_ses1 %>%
+  arrange(abs(Predicted_Outcome_Zscore)) %>%
+  slice(1:floor(0.1 * n()))
+
+best.ZBMI_ses2 <- df.ZBMI_ses2 %>%
+  arrange(abs(Predicted_Outcome_Zscore)) %>%
+  slice(1:floor(0.1 * n()))
+
+
+#this is the centre of zbmi=0
+(b = mean(acomp(best.ZBMI[,1:4])))
+
+# UPDATE: same for SEX
+(b_boys = mean(acomp(best.ZBMI_boys[,1:4])))
+(b_girls = mean(acomp(best.ZBMI_girls[,1:4])))
+
+### NEW UPDATE FOR INCOME
+(b_income1 = mean(acomp(best.ZBMI_income1[,1:4])))
+(b_income2 = mean(acomp(best.ZBMI_income2[,1:4])))
+(b_income3 = mean(acomp(best.ZBMI_income3[,1:4])))
+
+### NEW UPDATE FOR EDUCATIONAL
+(b_EDUC1 = mean(acomp(best.ZBMI_educ1[,1:4])))
+(b_EDUC2 = mean(acomp(best.ZBMI_educ2[,1:4])))
+(b_EDUC3 = mean(acomp(best.ZBMI_educ3[,1:4])))
+
+# UPDATE: same for SEX
+(b_SES1 = mean(acomp(best.ZBMI_ses1[,1:4])))
+(b_SES2 = mean(acomp(best.ZBMI_ses2[,1:4])))
+
+#put activity variables in minutes/day
+df.ZBMI1$Sleep=df.ZBMI1$Sleep*1440
+df.ZBMI1$SB=df.ZBMI1$SB*1440
+df.ZBMI1$LPA=df.ZBMI1$LPA*1440
+df.ZBMI1$MVPA=df.ZBMI1$MVPA*1440
+
+# UPDATE: same for df.ZBMI_boys and df.ZBMI_girls
+df.ZBMI_boys$Sleep=df.ZBMI_boys$Sleep*1440
+df.ZBMI_boys$SB=df.ZBMI_boys$SB*1440
+df.ZBMI_boys$LPA=df.ZBMI_boys$LPA*1440
+df.ZBMI_boys$MVPA=df.ZBMI_boys$MVPA*1440
+
+df.ZBMI_girls$Sleep=df.ZBMI_girls$Sleep*1440
+df.ZBMI_girls$SB=df.ZBMI_girls$SB*1440
+df.ZBMI_girls$LPA=df.ZBMI_girls$LPA*1440
+df.ZBMI_girls$MVPA=df.ZBMI_girls$MVPA*1440
+
+
+### NEW UPDATE FOR INCOME
+df.ZBMI_income1$Sleep=df.ZBMI_income1$Sleep*1440
+df.ZBMI_income1$SB=df.ZBMI_income1$SB*1440
+df.ZBMI_income1$LPA=df.ZBMI_income1$LPA*1440
+df.ZBMI_income1$MVPA=df.ZBMI_income1$MVPA*1440
+
+df.ZBMI_income2$Sleep=df.ZBMI_income2$Sleep*1440
+df.ZBMI_income2$SB=df.ZBMI_income2$SB*1440
+df.ZBMI_income2$LPA=df.ZBMI_income2$LPA*1440
+df.ZBMI_income2$MVPA=df.ZBMI_income2$MVPA*1440
+
+df.ZBMI_income3$Sleep=df.ZBMI_income3$Sleep*1440
+df.ZBMI_income3$SB=df.ZBMI_income3$SB*1440
+df.ZBMI_income3$LPA=df.ZBMI_income3$LPA*1440
+df.ZBMI_income3$MVPA=df.ZBMI_income3$MVPA*1440
+
+#get range of best
+range.best.sl=range(as.data.frame(best.ZBMI[,1])) 
+range.best.sb=range(as.data.frame(best.ZBMI[,2])) 
+range.best.lpa=range(as.data.frame(best.ZBMI[,3])) 
+range.best.mvpa=range(as.data.frame(best.ZBMI[,4]))
+
+#make nice results summary to look like mean (range low:high)
+sum.sl=c(b[1], 
+         range.best.sl, b[2], 
+         range.best.sb, b[3], 
+         range.best.lpa, b[4], 
+         range.best.mvpa) 
+
+ZBMI.sum=round(sum.sl*1440)
+
+#in minutes
+ZBMI.sum
+
+#in hours
+round(ZBMI.sum/60, 1)
+
+######BEST VARIABLES#####
+#ZBMI#
+best.ZBMI <- df.ZBMI1 %>% 
+  top_frac(.1, Predicted_Outcome_Zscore)
+
+# UPDATE
+best.ZBMI_boys <- df.ZBMI_boys %>% 
+  top_frac(.1, Predicted_Outcome_Zscore)
+
+best.ZBMI_girls <- df.ZBMI_girls %>% 
+  top_frac(.1, Predicted_Outcome_Zscore)
+
+
+######CODA variables#####
+
+#how much overlap with fitness and fatness best zones?
+ff5 = rbind(best.ZBMI[,1:4])
+
+#which predictive compositions are overlapping (not unique)
+head(ff5)
+
+table(duplicated(ff5))
+
+dups <- ff5 %>% group_by(Sleep, SB, LPA, MVPA) %>% summarise(id = n()) %>% filter(n()>1) %>% ungroup()
+
+# mean of fit and fatness overlapping 
+meanfifa.ZBMI <- mean(acomp(ff5[,1:4])) %>% 
+  rbind(mean(acomp(ff5[,1:4]))) %>%
+  as.data.frame()
+
+
+# UPDATE
+meanfifa.ZBMI_boys <- mean(acomp(best.ZBMI_boys[,1:4])) %>% 
+  rbind(mean(acomp(best.ZBMI_boys[,1:4]))) %>%
+  as.data.frame()
+
+meanfifa.ZBMI_girls <- mean(acomp(best.ZBMI_girls[,1:4])) %>% 
+  rbind(mean(acomp(best.ZBMI_girls[,1:4]))) %>%
+  as.data.frame()
+
+
+
+### NEW UPDATE FOR INCOME
+meanfifa.ZBMI_income1 <- mean(acomp(best.ZBMI_income1[,1:4])) %>% 
+  rbind(mean(acomp(best.ZBMI_income1[,1:4]))) %>%
+  as.data.frame()
+
+meanfifa.ZBMI_income2 <- mean(acomp(best.ZBMI_income2[,1:4])) %>% 
+  rbind(mean(acomp(best.ZBMI_income2[,1:4]))) %>%
+  as.data.frame()
+
+meanfifa.ZBMI_income3 <- mean(acomp(best.ZBMI_income3[,1:4])) %>% 
+  rbind(mean(acomp(best.ZBMI_income3[,1:4]))) %>%
+  as.data.frame()
+
+### NEW UPDATE FOR EDUCATIONAL
+meanfifa.ZBMI_EDUC1 <- mean(acomp(best.ZBMI_educ1[,1:4])) %>%
+  rbind(mean(acomp(best.ZBMI_educ1[,1:4]))) %>% as.data.frame()
+
+meanfifa.ZBMI_EDUC2 <- mean(acomp(best.ZBMI_educ2[,1:4])) %>%
+  rbind(mean(acomp(best.ZBMI_educ2[,1:4]))) %>% as.data.frame()
+
+meanfifa.ZBMI_EDUC3 <- mean(acomp(best.ZBMI_educ3[,1:4])) %>%
+  rbind(mean(acomp(best.ZBMI_educ3[,1:4]))) %>% as.data.frame()
+
+### NEW UPDATE FOR SES
+meanfifa.ZBMI_SES1 <- mean(acomp(best.ZBMI_ses1[,1:4])) %>%
+  rbind(mean(acomp(best.ZBMI_ses1[,1:4]))) %>%
+  as.data.frame()
+
+meanfifa.ZBMI_SES2 <- mean(acomp(best.ZBMI_ses2[,1:4])) %>%
+  rbind(mean(acomp(best.ZBMI_ses2[,1:4]))) %>%
+  as.data.frame()
+
+
+# Final plots
+library(compositions)
+library(plot3D)
+library(rgl)
+library(compositions)
+library(plotly)
+
+
+# 3D PLOT
+
+## OVERALL
+
+# Helper function to create 3D plotly plots from compositional data
+plot_comp_3d <- function(comp_data, colors = "lightgrey", sizes = 2, 
+                         opacity = 0.6, name = "Points") {
+  # Convert to data frame
+  df <- as.data.frame(comp_data)
+  
+  # Create 3D scatter plot
+  plot_ly(data = df,
+          x = ~Sleep, y = ~SB, z = ~LPA,
+          type = "scatter3d",
+          mode = "markers",
+          marker = list(size = sizes, 
+                        color = colors,
+                        opacity = opacity),
+          name = name)
+}
+
+# Create base plot with whole grid
+p <- plot_comp_3d(acomp(griddata[,1:4]), 
+                  colors = "lightgrey", 
+                  sizes = 3, 
+                  opacity = 0.6,
+                  name = "Predictive Grid")
+
+# Add best fatness (tomato)
+p <- p %>% add_trace(data = as.data.frame(acomp(best.ZBMI[,1:4])),
+                     x = ~Sleep, y = ~SB, z = ~LPA,
+                     type = "scatter3d",
+                     mode = "markers",
+                     marker = list(size = 4, color = "tomato", opacity = 1),
+                     name = "Best ZBMI")
+
+# Add center point (black)
+p <- p %>% add_trace(data = as.data.frame(acomp(meanfifa.ZBMI[,1:4])),
+                     x = ~Sleep, y = ~SB, z = ~LPA,
+                     type = "scatter3d",
+                     mode = "markers",
+                     marker = list(size = 15, color = "black", opacity = 1),
+                     name = "Center")
+
+# Display the plot
+p <- p %>% layout(scene = list(
+  xaxis = list(title = "Sleep"),
+  yaxis = list(title = "SB"),
+  zaxis = list(title = "LPA")
+))
+
+p
+
+
+
+
+### STRATIFIED DATA ###
+# Create base plot with whole grid
+p <- plot_comp_3d(acomp(griddata[,1:4]), 
+                  colors = "lightgrey", 
+                  sizes = 3, 
+                  opacity = 0.6,
+                  name = "Predictive Grid")
+
+# Add best 10% behovior for boys
+p <- p %>% add_trace(data = as.data.frame(acomp(best.ZBMI_boys[,1:4])),
+                     x = ~Sleep, y = ~SB, z = ~LPA,
+                     type = "scatter3d",
+                     mode = "markers",
+                     marker = list(size = 4, 
+                                   color = "blue", 
+                                   opacity = 0.5),
+                     name = "Best 10% ZBMI for boys")
+
+# Add best 10% behovior for boys
+p <- p %>% add_trace(data = as.data.frame(acomp(best.ZBMI_girls[,1:4])),
+                     x = ~Sleep, y = ~SB, z = ~LPA,
+                     type = "scatter3d",
+                     mode = "markers",
+                     marker = list(size = 4, 
+                                   color = "pink", 
+                                   opacity = 0.5),
+                     name = "Best 10% ZBMI for girls")
+
+
+# Add center point (black)
+p <- p %>% add_trace(data = as.data.frame(acomp(meanfifa.ZBMI[,1:4])),
+                     x = ~Sleep, y = ~SB, z = ~LPA,
+                     type = "scatter3d",
+                     mode = "markers",
+                     marker = list(size = 15, color = "black", opacity = 1),
+                     name = "Optimal Overall")
+
+# Add center point for boys (black)
+p <- p %>% add_trace(data = as.data.frame(acomp(meanfifa.ZBMI_boys[,1:4])),
+                     x = ~Sleep, y = ~SB, z = ~LPA,
+                     type = "scatter3d",
+                     mode = "markers",
+                     marker = list(size = 12, color = "steelblue", opacity = 0.8),
+                     name = "Optimal Boys")
+
+# Add center point for girls (black)
+p <- p %>% add_trace(data = as.data.frame(acomp(meanfifa.ZBMI_girls[,1:4])),
+                     x = ~Sleep, y = ~SB, z = ~LPA,
+                     type = "scatter3d",
+                     mode = "markers",
+                     marker = list(size = 12, color = "pink", opacity = 0.8),
+                     name = "Optimal Girls")
+
+# Display the plot
+p <- p %>% layout(scene = list(
+  xaxis = list(title = "Sleep"),
+  yaxis = list(title = "SB"),
+  zaxis = list(title = "LPA")
+))
+
+p
+
+
+# INCLUDING MVPA variable
+
+# Function using both size and color for MVPA
+plot_comp_4d_advanced <- function(comp_data, base_name = "Points") {
+  df <- as.data.frame(comp_data)
+  
+  # Normalize MVPA for size scaling (3-10 range)
+  size_scale <- 3 + (df$MVPA - min(df$MVPA)) / 
+    (max(df$MVPA) - min(df$MVPA)) * 7
+  
+  plot_ly(data = df,
+          x = ~Sleep, y = ~SB, z = ~LPA,
+          type = "scatter3d",
+          mode = "markers",
+          marker = list(
+            size = size_scale,
+            color = ~MVPA,
+            colorscale = list(
+              c(0, 'rgb(255,255,204)'),
+              c(0.5, 'rgb(161,218,180)'),
+              c(1, 'rgb(44,127,184)')
+            ),
+            showscale = TRUE,
+            colorbar = list(title = "MVPA"),
+            opacity = 0.8,
+            line = list(color = 'rgb(50,50,50)', width = 0.5)
+          ),
+          name = base_name,
+          text = ~paste("Sleep:", round(Sleep*1440, 1), "min",
+                        "<br>SB:", round(SB*1440, 1), "min",
+                        "<br>LPA:", round(LPA*1440, 1), "min",
+                        "<br>MVPA:", round(MVPA*1440, 1), "min"),
+          hoverinfo = "text")
+}
+
+# Create comprehensive plot
+p <- plot_comp_4d_advanced(acomp(griddata[,1:4]), "Predictive Grid")
+
+# Add best compositions with distinct colors
+best_zbmi_df <- as.data.frame(acomp(best.ZBMI[,1:4]))
+p <- p %>% add_trace(
+  data = best_zbmi_df,
+  x = ~Sleep, y = ~SB, z = ~LPA,
+  type = "scatter3d",
+  mode = "markers",
+  marker = list(size = 6, 
+                color = "tomato", 
+                opacity = 1,
+                line = list(color = 'darkred', width = 1),
+                showscale = FALSE),
+  name = "Best 10% ZBMI",
+  text = ~paste("Sleep:", round(Sleep*1440, 1), "min",
+                "<br>SB:", round(SB*1440, 1), "min",
+                "<br>LPA:", round(LPA*1440, 1), "min",
+                "<br>MVPA:", round(MVPA*1440, 1), "min"),
+  hoverinfo = "text"
+)
+
+p <- p %>% add_trace(data = as.data.frame(acomp(meanfifa.ZBMI[,1:4])),
+                x = ~Sleep, y = ~SB, z = ~LPA,
+                type = "scatter3d",
+                mode = "markers",
+                marker = list(size = 15, color = "black", opacity = 1,
+                              showscale = FALSE),
+                name = "Center")
+
+p <- p %>% layout(
+  title = "4D Compositional Analysis: Sleep, SB, LPA, MVPA",
+  scene = list(
+    xaxis = list(title = "Sleep"),
+    yaxis = list(title = "SB"),
+    zaxis = list(title = "LPA"),
+    camera = list(eye = list(x = 1.8, y = 1.8, z = 1.3))
+  ),
+  legend = list(
+    x = 0.5,  # Position to the right of the plot
+    y = -0.1,   # Vertically centered
+    xanchor = "center",
+    yanchor = "top",
+    orientation = "h"
+  )
+)
+
+p
+
+
+
+
+# Tetrahedron plot
+# Function to transform compositional data to tetrahedral coordinates
+tetrahedron_transform <- function(comp_df) {
+  # Regular tetrahedron vertices
+  h <- sqrt(2/3)  # height of tetrahedron
+  
+  vertices <- matrix(c(
+    0, 0, 0,                    # Sleep (origin)
+    1, 0, 0,                    # SB
+    0.5, sqrt(3)/2, 0,          # LPA
+    0.5, sqrt(3)/6, h           # MVPA
+  ), ncol = 3, byrow = TRUE)
+  
+  # Transform compositions to tetrahedral coordinates
+  x <- comp_df$Sleep * vertices[1,1] + comp_df$SB * vertices[2,1] + 
+    comp_df$LPA * vertices[3,1] + comp_df$MVPA * vertices[4,1]
+  
+  y <- comp_df$Sleep * vertices[1,2] + comp_df$SB * vertices[2,2] + 
+    comp_df$LPA * vertices[3,2] + comp_df$MVPA * vertices[4,2]
+  
+  z <- comp_df$Sleep * vertices[1,3] + comp_df$SB * vertices[2,3] + 
+    comp_df$LPA * vertices[3,3] + comp_df$MVPA * vertices[4,3]
+  
+  return(data.frame(x = x, y = y, z = z, 
+                    Sleep = comp_df$Sleep, 
+                    SB = comp_df$SB, 
+                    LPA = comp_df$LPA, 
+                    MVPA = comp_df$MVPA))
+}
+
+# Build tetrahedron edges
+add_tetrahedron_edges <- function(p) {
+  h <- sqrt(2/3)
+  vertices <- matrix(c(
+    0, 0, 0,
+    1, 0, 0,
+    0.5, sqrt(3)/2, 0,
+    0.5, sqrt(3)/6, h
+  ), ncol = 3, byrow = TRUE)
+  
+  # Define edges (pairs of vertex indices)
+  edges <- list(c(1,2), c(1,3), c(1,4), c(2,3), c(2,4), c(3,4))
+  
+  for(edge in edges) {
+    p <- p %>% add_trace(
+      type = "scatter3d",
+      mode = "lines",
+      x = vertices[edge, 1],
+      y = vertices[edge, 2],
+      z = vertices[edge, 3],
+      line = list(color = "black", width = 4),
+      showlegend = FALSE,
+      hoverinfo = "skip"
+    )
+  }
+  
+  # Add vertex labels
+  labels <- c("Sleep", "SB", "LPA", "MVPA")
+  label_offset <- 0.15
+  
+  p <- p %>% add_trace(
+    type = "scatter3d",
+    mode = "text",
+    x = vertices[,1] + c(-label_offset, label_offset, 0, 0),
+    y = vertices[,2] + c(-label_offset, -label_offset, label_offset, 0),
+    z = vertices[,3] + c(-label_offset, -label_offset, -label_offset, label_offset),
+    text = labels,
+    textfont = list(size = 16, color = "black", family = "Arial Black"),
+    showlegend = FALSE,
+    hoverinfo = "skip"
+  )
+  
+  return(p)
+}
+
+# Create complete tetrahedral plot
+create_complete_tetrahedral_plot <- function() {
+  # Initialize plot
+  p <- plot_ly()
+  
+  # Add tetrahedron frame
+  p <- add_tetrahedron_edges(p)
+  
+  # Transform grid data
+  grid_coords <- tetrahedron_transform(as.data.frame(acomp(griddata[,1:4])))
+  
+  # Add grid points
+  p <- p %>% add_trace(
+    x = ~x,
+    y = ~y,
+    z = ~z,
+    data = grid_coords,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 2, color = "lightgrey", opacity = 0.3),
+    name = "Grid",
+    text = ~paste("Sleep:", round(Sleep*1440, 1), "min",
+                  "<br>SB:", round(SB*1440, 1), "min",
+                  "<br>LPA:", round(LPA*1440, 1), "min",
+                  "<br>MVPA:", round(MVPA*1440, 1), "min"),
+    hoverinfo = "text"
+  )
+  
+  # Transform and add best ZBMI for overall purposes
+  #zbmi_coords <- tetrahedron_transform(as.data.frame(acomp(best.ZBMI[,1:4])))
+  #p <- p %>% add_trace(
+  #  x = ~x,
+  #  y = ~y,
+  #  z = ~z,
+  #  data = zbmi_coords,
+  #  type = "scatter3d",
+  #  mode = "markers",
+  #  marker = list(size = 5, color = "tomato", opacity = 0.5),
+  #  name = "Best 10% ZBMI for boys",
+  #  text = ~paste("Sleep:", round(Sleep*1440, 1), "min",
+  #                "<br>SB:", round(SB*1440, 1), "min",
+  #                "<br>LPA:", round(LPA*1440, 1), "min",
+  #                "<br>MVPA:", round(MVPA*1440, 1), "min"),
+  #  hoverinfo = "text"
+  #)
+  
+  # Transform and add best ZBMI for boys
+  zbmi_coords <- tetrahedron_transform(as.data.frame(acomp(best.ZBMI_boys[,1:4])))
+  p <- p %>% add_trace(
+    x = ~x,
+    y = ~y,
+    z = ~z,
+    data = zbmi_coords,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 5, color = "blue", opacity = 0.5),
+    name = "Best 10% ZBMI for boys",
+    text = ~paste("Sleep:", round(Sleep*1440, 1), "min",
+                  "<br>SB:", round(SB*1440, 1), "min",
+                  "<br>LPA:", round(LPA*1440, 1), "min",
+                  "<br>MVPA:", round(MVPA*1440, 1), "min"),
+    hoverinfo = "text"
+  )
+  
+  # Transform and add best ZBMI for girls
+  zbmi_coords <- tetrahedron_transform(as.data.frame(acomp(best.ZBMI_girls[,1:4])))
+  p <- p %>% add_trace(
+    x = ~x,
+    y = ~y,
+    z = ~z,
+    data = zbmi_coords,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 5, color = "pink", opacity = 0.5),
+    name = "Best 10% ZBMI for girls",
+    text = ~paste("Sleep:", round(Sleep*1440, 1), "min",
+                  "<br>SB:", round(SB*1440, 1), "min",
+                  "<br>LPA:", round(LPA*1440, 1), "min",
+                  "<br>MVPA:", round(MVPA*1440, 1), "min"),
+    hoverinfo = "text"
+  )
+  
+  # Optimal composition for BOYS
+  p <- p %>% add_trace(data = tetrahedron_transform(as.data.frame(acomp(meanfifa.ZBMI_boys[,1:4]))),
+                       x = ~x, y = ~y, z = ~z,
+                       type = "scatter3d",
+                       mode = "markers",
+                       marker = list(size = 10, color = "steelblue", opacity = 1,
+                                     showscale = FALSE),
+                       name = "Optimal Boys",
+                       text = ~paste("Sleep:", round(Sleep*1440, 1), "min",
+                                     "<br>SB:", round(SB*1440, 1), "min",
+                                     "<br>LPA:", round(LPA*1440, 1), "min",
+                                     "<br>MVPA:", round(MVPA*1440, 1), "min"),
+                       hoverinfo = "text")
+  
+  # Optimal composition for GIRLS
+  p <- p %>% add_trace(data = tetrahedron_transform(as.data.frame(acomp(meanfifa.ZBMI_girls[,1:4]))),
+                       x = ~x, y = ~y, z = ~z,
+                       type = "scatter3d",
+                       mode = "markers",
+                       marker = list(size = 10, color = "pink4", opacity = 1,
+                                     showscale = FALSE),
+                       name = "Optimal Girls",
+                       text = ~paste("Sleep:", round(Sleep*1440, 1), "min",
+                                     "<br>SB:", round(SB*1440, 1), "min",
+                                     "<br>LPA:", round(LPA*1440, 1), "min",
+                                     "<br>MVPA:", round(MVPA*1440, 1), "min"),
+                       hoverinfo = "text")
+  
+  
+  # Layout
+  p <- p %>% layout(
+    scene = list(
+      xaxis = list(visible = FALSE),
+      yaxis = list(visible = FALSE),
+      zaxis = list(visible = FALSE),
+      camera = list(eye = list(x = 1.8, y = 1.8, z = 1.3))
+    ),
+    legend = list(x = 1.02, y = 0.5, xanchor = "left", yanchor = "middle")
+  )
+  
+  return(p)
+}
+
+# Create and display the plot
+p <- create_complete_tetrahedral_plot()
+p
+
+
+
+
+### NEW UPDATE FOR INCOME ###
+
+# Tetrahedron plot
+# Function to transform compositional data to tetrahedral coordinates
+tetrahedron_transform <- function(comp_df) {
+  # Regular tetrahedron vertices
+  h <- sqrt(2/3)  # height of tetrahedron
+  
+  vertices <- matrix(c(
+    0, 0, 0,                    # Sleep (origin)
+    1, 0, 0,                    # SB
+    0.5, sqrt(3)/2, 0,          # LPA
+    0.5, sqrt(3)/6, h           # MVPA
+  ), ncol = 3, byrow = TRUE)
+  
+  # Transform compositions to tetrahedral coordinates
+  x <- comp_df$Sleep * vertices[1,1] + comp_df$SB * vertices[2,1] + 
+    comp_df$LPA * vertices[3,1] + comp_df$MVPA * vertices[4,1]
+  
+  y <- comp_df$Sleep * vertices[1,2] + comp_df$SB * vertices[2,2] + 
+    comp_df$LPA * vertices[3,2] + comp_df$MVPA * vertices[4,2]
+  
+  z <- comp_df$Sleep * vertices[1,3] + comp_df$SB * vertices[2,3] + 
+    comp_df$LPA * vertices[3,3] + comp_df$MVPA * vertices[4,3]
+  
+  return(data.frame(x = x, y = y, z = z, 
+                    Sleep = comp_df$Sleep, 
+                    SB = comp_df$SB, 
+                    LPA = comp_df$LPA, 
+                    MVPA = comp_df$MVPA))
+}
+
+# Build tetrahedron edges
+add_tetrahedron_edges <- function(p) {
+  h <- sqrt(2/3)
+  vertices <- matrix(c(
+    0, 0, 0,
+    1, 0, 0,
+    0.5, sqrt(3)/2, 0,
+    0.5, sqrt(3)/6, h
+  ), ncol = 3, byrow = TRUE)
+  
+  # Define edges (pairs of vertex indices)
+  edges <- list(c(1,2), c(1,3), c(1,4), c(2,3), c(2,4), c(3,4))
+  
+  for(edge in edges) {
+    p <- p %>% add_trace(
+      type = "scatter3d",
+      mode = "lines",
+      x = vertices[edge, 1],
+      y = vertices[edge, 2],
+      z = vertices[edge, 3],
+      line = list(color = "black", width = 4),
+      showlegend = FALSE,
+      hoverinfo = "skip"
+    )
+  }
+  
+  # Add vertex labels
+  labels <- c("Sleep", "SB", "LPA", "MVPA")
+  label_offset <- 0.15
+  
+  p <- p %>% add_trace(
+    type = "scatter3d",
+    mode = "text",
+    x = vertices[,1] + c(-label_offset, label_offset, 0, 0),
+    y = vertices[,2] + c(-label_offset, -label_offset, label_offset, 0),
+    z = vertices[,3] + c(-label_offset, -label_offset, -label_offset, label_offset),
+    text = labels,
+    textfont = list(size = 16, color = "black", family = "Arial Black"),
+    showlegend = FALSE,
+    hoverinfo = "skip"
+  )
+  
+  return(p)
+}
+
+# Create complete tetrahedral plot
+create_complete_tetrahedral_plot_income <- function() {
+  # Initialize plot
+  p <- plot_ly()
+  
+  # Add tetrahedron frame
+  p <- add_tetrahedron_edges(p)
+  
+  # Transform grid data
+  grid_coords <- tetrahedron_transform(as.data.frame(acomp(griddata[,1:4])))
+  
+  # Add grid points
+  p <- p %>% add_trace(
+    x = ~x,
+    y = ~y,
+    z = ~z,
+    data = grid_coords,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 2, color = "lightgrey", opacity = 0.3),
+    name = "Grid",
+    text = ~paste("Sleep:", round(Sleep*1440, 1), "min",
+                  "<br>SB:", round(SB*1440, 1), "min",
+                  "<br>LPA:", round(LPA*1440, 1), "min",
+                  "<br>MVPA:", round(MVPA*1440, 1), "min"),
+    hoverinfo = "text"
+  )
+  
+  # Transform and add best ZBMI for overall purposes
+  #zbmi_coords <- tetrahedron_transform(as.data.frame(acomp(best.ZBMI[,1:4])))
+  #p <- p %>% add_trace(
+  #  x = ~x,
+  #  y = ~y,
+  #  z = ~z,
+  #  data = zbmi_coords,
+  #  type = "scatter3d",
+  #  mode = "markers",
+  #  marker = list(size = 5, color = "tomato", opacity = 0.5),
+  #  name = "Best 10% ZBMI for boys",
+  #  text = ~paste("Sleep:", round(Sleep*1440, 1), "min",
+  #                "<br>SB:", round(SB*1440, 1), "min",
+  #                "<br>LPA:", round(LPA*1440, 1), "min",
+  #                "<br>MVPA:", round(MVPA*1440, 1), "min"),
+  #  hoverinfo = "text"
+  #)
+  
+  # Transform and add best ZBMI for INCOME = 1
+  zbmi_coords <- tetrahedron_transform(as.data.frame(acomp(best.ZBMI_income1[,1:4])))
+  p <- p %>% add_trace(
+    x = ~x,
+    y = ~y,
+    z = ~z,
+    data = zbmi_coords,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 5, color = "red3", opacity = 0.5),
+    name = "Best 10% ZBMI for INCOME = 1",
+    text = ~paste("Sleep:", round(Sleep*1440, 1), "min",
+                  "<br>SB:", round(SB*1440, 1), "min",
+                  "<br>LPA:", round(LPA*1440, 1), "min",
+                  "<br>MVPA:", round(MVPA*1440, 1), "min"),
+    hoverinfo = "text"
+  )
+  
+  # Transform and add best ZBMI for INCOME = 2
+  zbmi_coords <- tetrahedron_transform(as.data.frame(acomp(best.ZBMI_income2[,1:4])))
+  p <- p %>% add_trace(
+    x = ~x,
+    y = ~y,
+    z = ~z,
+    data = zbmi_coords,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 5, color = "gold2", opacity = 0.5),
+    name = "Best 10% ZBMI for INCOME = 2",
+    text = ~paste("Sleep:", round(Sleep*1440, 1), "min",
+                  "<br>SB:", round(SB*1440, 1), "min",
+                  "<br>LPA:", round(LPA*1440, 1), "min",
+                  "<br>MVPA:", round(MVPA*1440, 1), "min"),
+    hoverinfo = "text"
+  )
+  
+  # Transform and add best ZBMI for girls
+  zbmi_coords <- tetrahedron_transform(as.data.frame(acomp(best.ZBMI_income3[,1:4])))
+  p <- p %>% add_trace(
+    x = ~x,
+    y = ~y,
+    z = ~z,
+    data = zbmi_coords,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 5, color = "green2", opacity = 0.5),
+    name = "Best 10% ZBMI for INCOME = 3",
+    text = ~paste("Sleep:", round(Sleep*1440, 1), "min",
+                  "<br>SB:", round(SB*1440, 1), "min",
+                  "<br>LPA:", round(LPA*1440, 1), "min",
+                  "<br>MVPA:", round(MVPA*1440, 1), "min"),
+    hoverinfo = "text"
+  )
+  
+  # Optimal composition for INCOME = 1
+  p <- p %>% add_trace(data = tetrahedron_transform(as.data.frame(acomp(meanfifa.ZBMI_income1[,1:4]))),
+                       x = ~x, y = ~y, z = ~z,
+                       type = "scatter3d",
+                       mode = "markers",
+                       marker = list(size = 10, color = "darkred", opacity = 1,
+                                     showscale = FALSE),
+                       name = "Optimal INCOME = 1",
+                       text = ~paste("Sleep:", round(Sleep*1440, 1), "min",
+                                     "<br>SB:", round(SB*1440, 1), "min",
+                                     "<br>LPA:", round(LPA*1440, 1), "min",
+                                     "<br>MVPA:", round(MVPA*1440, 1), "min"),
+                       hoverinfo = "text")
+  
+  # Optimal composition for INCOME = 2
+  p <- p %>% add_trace(data = tetrahedron_transform(as.data.frame(acomp(meanfifa.ZBMI_income2[,1:4]))),
+                       x = ~x, y = ~y, z = ~z,
+                       type = "scatter3d",
+                       mode = "markers",
+                       marker = list(size = 10, color = "gold4", opacity = 1,
+                                     showscale = FALSE),
+                       name = "Optimal INCOME = 2",
+                       text = ~paste("Sleep:", round(Sleep*1440, 1), "min",
+                                     "<br>SB:", round(SB*1440, 1), "min",
+                                     "<br>LPA:", round(LPA*1440, 1), "min",
+                                     "<br>MVPA:", round(MVPA*1440, 1), "min"),
+                       hoverinfo = "text")
+  
+  # Optimal composition for INCOME = 3
+  p <- p %>% add_trace(data = tetrahedron_transform(as.data.frame(acomp(meanfifa.ZBMI_income3[,1:4]))),
+                       x = ~x, y = ~y, z = ~z,
+                       type = "scatter3d",
+                       mode = "markers",
+                       marker = list(size = 10, color = "green4", opacity = 1,
+                                     showscale = FALSE),
+                       name = "Optimal INCOME = 3",
+                       text = ~paste("Sleep:", round(Sleep*1440, 1), "min",
+                                     "<br>SB:", round(SB*1440, 1), "min",
+                                     "<br>LPA:", round(LPA*1440, 1), "min",
+                                     "<br>MVPA:", round(MVPA*1440, 1), "min"),
+                       hoverinfo = "text")
+  
+  
+  # Layout
+  p <- p %>% layout(
+    scene = list(
+      xaxis = list(visible = FALSE),
+      yaxis = list(visible = FALSE),
+      zaxis = list(visible = FALSE),
+      camera = list(eye = list(x = 1.8, y = 1.8, z = 1.3))
+    ),
+    legend = list(x = 1.02, y = 0.5, xanchor = "left", yanchor = "middle")
+  )
+  
+  return(p)
+}
+
+# Create and display the plot
+p <- create_complete_tetrahedral_plot_income()
+p
+
+
+### NEW UPDATE FOR EDUC ###
+
+create_complete_tetrahedral_plot_educ <- function() {
+  
+  p <- plot_ly()
+  p <- add_tetrahedron_edges(p)
+  
+  grid_coords <- tetrahedron_transform(as.data.frame(acomp(griddata[,1:4])))
+  
+  p <- p %>% add_trace(
+    x = ~x, y = ~y, z = ~z,
+    data = grid_coords,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 2, color = "lightgrey", opacity = 0.3),
+    name = "Grid",
+    text = ~paste("Sleep:", round(Sleep*1440, 1), "min",
+                  "<br>SB:", round(SB*1440, 1), "min",
+                  "<br>LPA:", round(LPA*1440, 1), "min",
+                  "<br>MVPA:", round(MVPA*1440, 1), "min"),
+    hoverinfo = "text"
+  )
+  
+  # EDUC = 1
+  zbmi_coords <- tetrahedron_transform(as.data.frame(acomp(best.ZBMI_educ1[,1:4])))
+  p <- p %>% add_trace(
+    x = ~x, y = ~y, z = ~z,
+    data = zbmi_coords,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 5, color = "red3", opacity = 0.5),
+    name = "Best 10% ZBMI for EDUC = 1",
+    hoverinfo = "text"
+  )
+  
+  # EDUC = 2
+  zbmi_coords <- tetrahedron_transform(as.data.frame(acomp(best.ZBMI_educ2[,1:4])))
+  p <- p %>% add_trace(
+    x = ~x, y = ~y, z = ~z,
+    data = zbmi_coords,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 5, color = "gold2", opacity = 0.5),
+    name = "Best 10% ZBMI for EDUC = 2",
+    hoverinfo = "text"
+  )
+  
+  # EDUC = 3
+  zbmi_coords <- tetrahedron_transform(as.data.frame(acomp(best.ZBMI_educ3[,1:4])))
+  p <- p %>% add_trace(
+    x = ~x, y = ~y, z = ~z,
+    data = zbmi_coords,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 5, color = "green2", opacity = 0.5),
+    name = "Best 10% ZBMI for EDUC = 3",
+    hoverinfo = "text"
+  )
+  
+  # Optimal EDUC = 1
+  p <- p %>% add_trace(
+    data = tetrahedron_transform(as.data.frame(acomp(meanfifa.ZBMI_EDUC1[,1:4]))),
+    x = ~x, y = ~y, z = ~z,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 10, color = "darkred", opacity = 1),
+    name = "Optimal EDUC = 1"
+  )
+  
+  # Optimal EDUC = 2
+  p <- p %>% add_trace(
+    data = tetrahedron_transform(as.data.frame(acomp(meanfifa.ZBMI_EDUC2[,1:4]))),
+    x = ~x, y = ~y, z = ~z,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 10, color = "gold4", opacity = 1),
+    name = "Optimal EDUC = 2"
+  )
+  
+  # Optimal EDUC = 3
+  p <- p %>% add_trace(
+    data = tetrahedron_transform(as.data.frame(acomp(meanfifa.ZBMI_EDUC3[,1:4]))),
+    x = ~x, y = ~y, z = ~z,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 10, color = "green4", opacity = 1),
+    name = "Optimal EDUC = 3"
+  )
+  
+  p <- p %>% layout(
+    scene = list(
+      xaxis = list(visible = FALSE),
+      yaxis = list(visible = FALSE),
+      zaxis = list(visible = FALSE),
+      camera = list(eye = list(x = 1.8, y = 1.8, z = 1.3))
+    ),
+    legend = list(x = 1.02, y = 0.5)
+  )
+  
+  return(p)
+}
+
+p <- create_complete_tetrahedral_plot_educ()
+p
+
+
+### NEW UPDATE FOR SES ###
+
+create_complete_tetrahedral_plot_ses <- function() {
+  
+  p <- plot_ly()
+  p <- add_tetrahedron_edges(p)
+  
+  grid_coords <- tetrahedron_transform(as.data.frame(acomp(griddata[,1:4])))
+  
+  p <- p %>% add_trace(
+    x = ~x, y = ~y, z = ~z,
+    data = grid_coords,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 2, color = "lightgrey", opacity = 0.3),
+    name = "Grid"
+  )
+  
+  # SES = 1 (Urban)
+  zbmi_coords <- tetrahedron_transform(as.data.frame(acomp(best.ZBMI_ses1[,1:4])))
+  p <- p %>% add_trace(
+    x = ~x, y = ~y, z = ~z,
+    data = zbmi_coords,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 5, color = "dodgerblue", opacity = 0.5),
+    name = "Best 10% ZBMI Urban"
+  )
+  
+  # SES = 2 (Rural)
+  zbmi_coords <- tetrahedron_transform(as.data.frame(acomp(best.ZBMI_ses2[,1:4])))
+  p <- p %>% add_trace(
+    x = ~x, y = ~y, z = ~z,
+    data = zbmi_coords,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 5, color = "darkorange", opacity = 0.5),
+    name = "Best 10% ZBMI Rural"
+  )
+  
+  # Optimal Urban
+  p <- p %>% add_trace(
+    data = tetrahedron_transform(as.data.frame(acomp(meanfifa.ZBMI_SES1[,1:4]))),
+    x = ~x, y = ~y, z = ~z,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 10, color = "blue4", opacity = 1),
+    name = "Optimal Urban"
+  )
+  
+  # Optimal Rural
+  p <- p %>% add_trace(
+    data = tetrahedron_transform(as.data.frame(acomp(meanfifa.ZBMI_SES2[,1:4]))),
+    x = ~x, y = ~y, z = ~z,
+    type = "scatter3d",
+    mode = "markers",
+    marker = list(size = 10, color = "orange4", opacity = 1),
+    name = "Optimal Rural"
+  )
+  
+  p <- p %>% layout(
+    scene = list(
+      xaxis = list(visible = FALSE),
+      yaxis = list(visible = FALSE),
+      zaxis = list(visible = FALSE),
+      camera = list(eye = list(x = 1.8, y = 1.8, z = 1.3))
+    ),
+    legend = list(x = 1.02, y = 0.5)
+  )
+  
+  return(p)
+}
+
+p <- create_complete_tetrahedral_plot_ses()
+p
+
